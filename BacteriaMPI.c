@@ -3,24 +3,31 @@
 #include <math.h>
 #include <stdlib.h>
 #include <time.h>
-#include <pthread.h>
+#include <mpi.h>
 #include <string.h>
 
 // Global variables for command line arguments
 int MAXITER;
-int NTHREADS;
+int NPROCS;
 
 //#define DEBUG
 
-pthread_barrier_t barrier;
-pthread_barrier_t barrier2;
+// MPI variables
+int rank, size;
 
-pthread_t *threads;  // Dynamic allocation since NTHREADS is now a variable
+// Local grid for each process (includes ghost rows)
+char *local_grid;    // size: (local_rows + 2) * cols, includes top and bottom ghost rows
+char *local_new_grid;
 
+// Full grid only for rank 0
 char *grid;
 char *new_grid;
 char *groundtruth;
 int rows, cols;
+
+// Local rows per process
+int local_rows;
+int start_row, end_row;
  
 int read_from_file(const char *filename)
 {
@@ -179,8 +186,8 @@ void swap_ptr(char **p1, char **p2)
     *p1 = *p2;
     *p2 = tmp;
 }
- 
-int number_of_neighbors(int i, int j)
+
+int number_of_neighbors(char *g, int i, int j, int max_rows, int max_cols)
 {
     int count = 0;
     for (int di = -1; di <= 1; di++)
@@ -193,9 +200,9 @@ int number_of_neighbors(int i, int j)
             int ni = i + di;
             int nj = j + dj;
             
-            if (ni >= 0 && ni < rows && nj >= 0 && nj < cols)
+            if (ni >= 0 && ni < max_rows && nj >= 0 && nj < max_cols)
             {
-                count += grid[ni * cols + nj];
+                count += g[ni * max_cols + nj];
             }
         }
     }
@@ -216,7 +223,7 @@ void serial_bacteria()
         for (i = 0; i < rows; i++)
             for (j = 0; j < cols; j++)
             {
-               neighbors = number_of_neighbors(i, j);
+               neighbors = number_of_neighbors(grid, i, j, rows, cols);
                switch(neighbors) 
                {
                    case 2:
@@ -242,69 +249,114 @@ void serial_bacteria()
 #endif
 }
 
-void *bacteria_thread(void *arg)
+void mpi_bacteria(void)
 {
-    long id = (long)arg;
     int i, j, time, neighbors;
     
-    int start_row = id * rows / NTHREADS;
-    int end_row = (id + 1) * rows / NTHREADS;
+    // Calculate total local rows including ghost rows
+    // Ghost row at top (index 0) and ghost row at bottom (index local_rows+1)
+    int total_local_rows = local_rows + 2;
+    
+    // Allocate local grids with ghost rows
+    local_grid = (char *)malloc(total_local_rows * cols * sizeof(char));
+    local_new_grid = (char *)malloc(total_local_rows * cols * sizeof(char));
+    
+    if (!local_grid || !local_new_grid)
+    {
+        printf("Rank %d: Memory allocation error for local grids\n", rank);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    
+    // Initialize ghost rows to 0
+    memset(local_grid, 0, total_local_rows * cols * sizeof(char));
+    memset(local_new_grid, 0, total_local_rows * cols * sizeof(char));
 
+    // Distribute rows from rank 0 to all processes
+    int *sendcounts = NULL;
+    int *displs = NULL;
+    
+    if (rank == 0)
+    {
+        sendcounts = (int *)malloc(size * sizeof(int));
+        displs = (int *)malloc(size * sizeof(int));
+        
+        for (int p = 0; p < size; p++)
+        {
+            int p_start = p * rows / size;
+            int p_end = (p + 1) * rows / size;
+            sendcounts[p] = (p_end - p_start) * cols;
+            displs[p] = p_start * cols;
+        }
+    }
+    
+    // Scatter the initial grid (into row 1 onwards, skipping ghost row at index 0)
+    MPI_Scatterv(grid, sendcounts, displs, MPI_CHAR,
+                 &local_grid[cols], local_rows * cols, MPI_CHAR,
+                 0, MPI_COMM_WORLD);
+    
+    // Main evolution loop
     for (time = 0; time < MAXITER; time++)
     {
-        for(i = start_row; i < end_row; i++)
-            for(j = 0; j < cols; j++)
+        // Exchange borders with neighbors
+        
+        // Exchange with upper neighbor (rank-1)
+        if (rank > 0)
+        {
+            // Send my first real row (index 1) to rank-1
+            MPI_Send(&local_grid[1 * cols], cols, MPI_CHAR, rank - 1, 0, MPI_COMM_WORLD);
+            // Receive from rank-1 into my top ghost row (index 0)
+            MPI_Recv(&local_grid[0 * cols], cols, MPI_CHAR, rank - 1, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
+        
+        // Exchange with lower neighbor (rank+1)
+        if (rank < size - 1)
+        {
+            // Receive from rank+1 into my bottom ghost row (index local_rows+1)
+            MPI_Recv(&local_grid[(local_rows + 1) * cols], cols, MPI_CHAR, rank + 1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            // Send my last real row (index local_rows) to rank+1
+            MPI_Send(&local_grid[local_rows * cols], cols, MPI_CHAR, rank + 1, 1, MPI_COMM_WORLD);
+        }
+        
+        // Compute new generation for local rows (indices 1 to local_rows)
+        for (i = 1; i <= local_rows; i++)
+        {
+            for (j = 0; j < cols; j++)
             {
-                neighbors = number_of_neighbors(i, j);
+                neighbors = number_of_neighbors(local_grid, i, j, total_local_rows, cols);
                 switch(neighbors) 
-               {
+                {
                     case 2:
-                        new_grid[i * cols + j] = grid[i * cols + j];
+                        local_new_grid[i * cols + j] = local_grid[i * cols + j];
                         break;
                     case 3:
-                        new_grid[i * cols + j] = 1;
+                        local_new_grid[i * cols + j] = 1;
                         break;
                     case 0:
                     case 1:
                     default:
-                        new_grid[i * cols + j] = 0;
+                        local_new_grid[i * cols + j] = 0;
                         break;
-               }
+                }
             }
-        pthread_barrier_wait(&barrier);
-        pthread_barrier_wait(&barrier2);
+        }
+        
+        // Swap local grids
+        swap_ptr(&local_grid, &local_new_grid);
     }
-    return NULL;
-}
-void parallel_bacteria(void)
-{
-    pthread_barrier_init(&barrier, NULL, NTHREADS+1);
-    pthread_barrier_init(&barrier2, NULL, NTHREADS+1);
     
-    for (int i = 0; i < NTHREADS; i++)
+    // Gather results back to rank 0 (from row 1 onwards, skipping ghost row)
+    MPI_Gatherv(&local_grid[cols], local_rows * cols, MPI_CHAR,
+                grid, sendcounts, displs, MPI_CHAR,
+                0, MPI_COMM_WORLD);
+    
+    // Cleanup
+    if (rank == 0)
     {
-        pthread_create(&threads[i], NULL, bacteria_thread, (void *)(long)i);
+        free(sendcounts);
+        free(displs);
     }
-    for(int i = 0; i < MAXITER; i++)
-    {
-#ifdef DEBUG
-        printf("\nGeneration %d (Parallel)\n", i);
-        print_grid();
-#endif
-        pthread_barrier_wait(&barrier);
-        swap_ptr(&grid, &new_grid);
-        pthread_barrier_wait(&barrier2);
-    }
-#ifdef DEBUG
-    printf("\nFinal Generation %d (Parallel)\n", MAXITER);
-    print_grid();
-#endif
-    for (int i = 0; i < NTHREADS; i++)
-    {
-        pthread_join(threads[i], NULL);
-    }
-    pthread_barrier_destroy(&barrier);
-    pthread_barrier_destroy(&barrier2);
+    free(local_grid);
+    free(local_new_grid);
 }
 
  
@@ -314,75 +366,137 @@ int main(int argc, char *argv[])
     double serial, parallel;
     char output_filename[256];
 
+    // Initialize MPI first
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    NPROCS = size;
+
     // Validate command line arguments
-    if (argc < 4)
+    if (argc < 3)
     {
-        printf("Usage: %s <input_file> <num_generations> <num_threads>\n", argv[0]);
-        printf("Example: %s bacteria1000.txt 250 10\n", argv[0]);
+        if (rank == 0)
+        {
+            printf("Usage: mpirun -np <num_processes> %s <input_file> <num_generations>\n", argv[0]);
+            printf("Example: mpirun -np 4 %s bacteria1000.txt 250\n", argv[0]);
+        }
+        MPI_Finalize();
         return 1;
     }
 
     // Parse command line arguments
     MAXITER = atoi(argv[2]);
-    NTHREADS = atoi(argv[3]);
 
-    if (MAXITER <= 0 || NTHREADS <= 0)
+    if (MAXITER <= 0)
     {
-        printf("Error: num_generations and num_threads must be positive integers\n");
+        if (rank == 0)
+            printf("Error: num_generations must be positive integer\n");
+        MPI_Finalize();
         return 1;
     }
 
-    // Allocate threads array dynamically
-    threads = (pthread_t *)malloc(NTHREADS * sizeof(pthread_t));
-    if (!threads)
+    // Only rank 0 reads the file and runs serial version
+    if (rank == 0)
     {
-        printf("Memory allocation error for threads\n");
-        return 1;
+        read_from_file(argv[1]);
+        printf("Initialize grid size Rows=%d, Cols=%d\n", rows, cols);
+
+        printf("Start Serial with MAXITER=%d\n", MAXITER);
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        serial_bacteria();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        serial = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+        printf("Serial Time %lf \n", serial);
+        
+        strcpy(output_filename, argv[1]);
+        *(strchr(output_filename, '.')) = '\0';
+        strcat(output_filename, "_serial_out.txt");
+        write_grid(output_filename);
+        save_groundtruth(); // keep values from serial result as ground truth for later comparison
+
+        printf("Initialize grid size Rows=%d, Cols=%d\n", rows, cols);
+        read_from_file(argv[1]); // init again the same grid for parallel version
     }
 
+    if (rank == 0)
+    {
+        printf("Start Parallel with NPROCS=%d\n", NPROCS);
+        clock_gettime(CLOCK_MONOTONIC, &start);
+    }
 
-    read_from_file(argv[1]);
-    printf("Initialize grid size Rows=%d, Cols=%d\n", rows, cols);
-
-    printf("Start Serial with MAXITER=%d\n", MAXITER);
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    serial_bacteria();
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    serial = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-    printf("Serial Time %lf \n", serial);
+    // Broadcast dimensions to all processes
+    MPI_Bcast(&rows, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&cols, 1, MPI_INT, 0, MPI_COMM_WORLD);
     
-    strcpy(output_filename, argv[1]);
-    *(strchr(output_filename, '.')) = '\0';
-    strcat(output_filename, "_serial_out.txt");
-    write_grid(output_filename);
-    save_groundtruth(); // keep values from serial result as ground truth for later comparison
-
-    printf("Initialize grid size Rows=%d, Cols=%d\n", rows, cols);
-    read_from_file(argv[1]); // init again the same grid for parallel version
-
-    printf("Start Paralel with NTHREADS=%d\n", NTHREADS);
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    parallel_bacteria();
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    parallel = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-    printf("Parallel Time %lf  Speedup %lf \n", parallel, serial / parallel);
+    // Calculate local rows for each process
+    //This is the formula that helps to distribute the rows equally between the processes
+    //For example if we have 10 rows and 4 processes, the rows will be distributed as follows:
+    // 0: 0-1
+    // 1: 2-4
+    // 2: 5-6
+    // 3: 7-9
+    start_row = rank * rows / size;
+    end_row = (rank + 1) * rows / size;
+    local_rows = end_row - start_row;
     
-    strcpy(output_filename, argv[1]);
-    *(strchr(output_filename, '.')) = '\0';
-    strcat(output_filename, "_parallel_out.txt");
-    write_grid(output_filename);
+    // Allocate grid memory for non-root processes
+    if (rank != 0)
+    {
+        grid = (char *)malloc(rows * cols * sizeof(char));
+        if (!grid)
+        {
+            printf("Rank %d: Memory allocation error for full grid\n", rank);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+    }
     
-    if (!equal_groundtruth())
-        printf("!!! Parallel version produces a different result! \n");
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    mpi_bacteria();
+    
+    MPI_Barrier(MPI_COMM_WORLD);
+    
+    // Only rank 0 writes output and compares results
+    if (rank == 0)
+    {
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        parallel = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+        printf("Parallel Time %lf  Speedup %lf \n", parallel, serial / parallel);
+        
+        strcpy(output_filename, argv[1]);
+        *(strchr(output_filename, '.')) = '\0';
+        strcat(output_filename, "_parallel_out.txt");
+        write_grid(output_filename);
+        
+        if (!equal_groundtruth())
+            printf("!!! Parallel version produces a different result! \n");
+        else
+            printf("Parallel version produced the same result \n");
+
+        // Cleanup allocated memory
+        free(grid);
+        free(new_grid);
+        free(groundtruth);
+    }
     else
-        printf("Parallel version produced the same result \n");
-
-    // Cleanup allocated memory
-    free(threads);
-    free(grid);
-    free(new_grid);
-    free(groundtruth);
+    {
+        // Cleanup for non-root processes
+        free(grid);
+    }
     
-
+    MPI_Finalize();
     return 0;
 }
+
+/*
+└─$ mpiexec -np 3 ./prog bacteria1000.txt 250
+Initialize grid size Rows=1000, Cols=1000
+Start Serial with MAXITER=250
+Serial Time 8.104392
+Grid saved to bacteria1000_serial_out.txt
+Initialize grid size Rows=1000, Cols=1000
+Start Parallel with NPROCS=3
+Parallel Time 3.269405  Speedup 2.478858
+Grid saved to bacteria1000_parallel_out.txt
+Parallel version produced the same result
+*/
