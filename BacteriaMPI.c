@@ -5,6 +5,7 @@
 #include <time.h>
 #include <mpi.h>
 #include <string.h>
+#include <stdint.h>
 
 // Global variables for command line arguments
 int MAXITER;
@@ -42,6 +43,22 @@ int read_from_file(const char *filename)
     if (fscanf(file, "%d %d", &rows, &cols) != 2)
     {
         printf("Error reading dimensions from file\n");
+        fclose(file);
+        return 0;
+    }
+    
+    // Validate dimensions
+    if (rows <= 0 || cols <= 0)
+    {
+        printf("Error: dimensions must be positive (rows=%d, cols=%d)\n", rows, cols);
+        fclose(file);
+        return 0;
+    }
+    
+    // Check for integer overflow before multiplication
+    if (cols > 0 && rows > SIZE_MAX / cols)
+    {
+        printf("Error: grid size too large (would cause overflow)\n");
         fclose(file);
         return 0;
     }
@@ -166,11 +183,18 @@ void print_grid(void)
  
 void save_groundtruth(void)
 {
+    // Check for integer overflow (already validated in read_from_file, but being safe)
+    if (cols > 0 && rows > SIZE_MAX / cols)
+    {
+        printf("Error: groundtruth size too large (would cause overflow)\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    
     groundtruth = (char *)malloc(rows * cols * sizeof(char));
     if (!groundtruth)
     {
         printf("Memory allocation error for groundtruth result\n");
-        exit(1);
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
     for (int i = 0; i < rows; i++)
@@ -257,6 +281,13 @@ void mpi_bacteria(void)
     // Ghost row at top (index 0) and ghost row at bottom (index local_rows+1)
     int total_local_rows = local_rows + 2;
     
+    // Check for integer overflow before allocation
+    if (cols > 0 && total_local_rows > SIZE_MAX / cols)
+    {
+        printf("Rank %d: Local grid size too large (would cause overflow)\n", rank);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    
     // Allocate local grids with ghost rows
     local_grid = (char *)malloc(total_local_rows * cols * sizeof(char));
     local_new_grid = (char *)malloc(total_local_rows * cols * sizeof(char));
@@ -264,6 +295,8 @@ void mpi_bacteria(void)
     if (!local_grid || !local_new_grid)
     {
         printf("Rank %d: Memory allocation error for local grids\n", rank);
+        free(local_grid);
+        free(local_new_grid);
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
     
@@ -279,6 +312,14 @@ void mpi_bacteria(void)
     {
         sendcounts = (int *)malloc(size * sizeof(int));
         displs = (int *)malloc(size * sizeof(int));
+        
+        if (!sendcounts || !displs)
+        {
+            printf("Rank %d: Memory allocation error for sendcounts/displs\n", rank);
+            free(sendcounts);
+            free(displs);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
         
         for (int p = 0; p < size; p++)
         {
@@ -296,10 +337,8 @@ void mpi_bacteria(void)
     
     // Main evolution loop
     for (time = 0; time < MAXITER; time++)
-    {
-        // Exchange borders with neighbors
-        
-        // Exchange with upper neighbor (rank-1)
+    {   
+        // Exchange border with upper neighbor (rank-1)
         if (rank > 0)
         {
             // Send my first real row (index 1) to rank-1
@@ -308,7 +347,7 @@ void mpi_bacteria(void)
             MPI_Recv(&local_grid[0 * cols], cols, MPI_CHAR, rank - 1, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         }
         
-        // Exchange with lower neighbor (rank+1)
+        // Exchange border with lower neighbor (rank+1)
         if (rank < size - 1)
         {
             // Receive from rank+1 into my bottom ghost row (index local_rows+1)
@@ -394,11 +433,24 @@ int main(int argc, char *argv[])
         MPI_Finalize();
         return 1;
     }
+    
+    // Check filename length (22 = length of "_parallel_out.txt" suffix)
+    if (strlen(argv[1]) > 256 - 22)
+    {
+        if (rank == 0)
+            printf("Error: filename too long (max %d characters)\n", 256 - 22);
+        MPI_Finalize();
+        return 1;
+    }
 
     // Only rank 0 reads the file and runs serial version
     if (rank == 0)
     {
-        read_from_file(argv[1]);
+        if (!read_from_file(argv[1]))
+        {
+            printf("Failed to read input file\n");
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
         printf("Initialize grid size Rows=%d, Cols=%d\n", rows, cols);
 
         printf("Start Serial with MAXITER=%d\n", MAXITER);
@@ -409,13 +461,23 @@ int main(int argc, char *argv[])
         printf("Serial Time %lf \n", serial);
         
         strcpy(output_filename, argv[1]);
-        *(strchr(output_filename, '.')) = '\0';
+        char *dot = strchr(output_filename, '.');
+        if (dot != NULL)
+        {
+            *dot = '\0';
+        }
         strcat(output_filename, "_serial_out.txt");
         write_grid(output_filename);
         save_groundtruth(); // keep values from serial result as ground truth for later comparison
 
         printf("Initialize grid size Rows=%d, Cols=%d\n", rows, cols);
-        read_from_file(argv[1]); // init again the same grid for parallel version
+        free(grid);
+        free(new_grid);
+        if (!read_from_file(argv[1]))
+        {
+            printf("Failed to re-read input file\n");
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
     }
 
     if (rank == 0)
@@ -430,7 +492,7 @@ int main(int argc, char *argv[])
     
     // Calculate local rows for each process
     //This is the formula that helps to distribute the rows equally between the processes
-    //For example if we have 10 rows and 4 processes, the rows will be distributed as follows:
+    //For example if we have 10 rows and 4 processes, the rows will be distributed like this:
     // 0: 0-1
     // 1: 2-4
     // 2: 5-6
@@ -439,16 +501,6 @@ int main(int argc, char *argv[])
     end_row = (rank + 1) * rows / size;
     local_rows = end_row - start_row;
     
-    // Allocate grid memory for non-root processes
-    if (rank != 0)
-    {
-        grid = (char *)malloc(rows * cols * sizeof(char));
-        if (!grid)
-        {
-            printf("Rank %d: Memory allocation error for full grid\n", rank);
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
-    }
     
     MPI_Barrier(MPI_COMM_WORLD);
 
@@ -464,7 +516,11 @@ int main(int argc, char *argv[])
         printf("Parallel Time %lf  Speedup %lf \n", parallel, serial / parallel);
         
         strcpy(output_filename, argv[1]);
-        *(strchr(output_filename, '.')) = '\0';
+        char *dot = strchr(output_filename, '.');
+        if (dot != NULL)
+        {
+            *dot = '\0';
+        }
         strcat(output_filename, "_parallel_out.txt");
         write_grid(output_filename);
         
@@ -477,11 +533,6 @@ int main(int argc, char *argv[])
         free(grid);
         free(new_grid);
         free(groundtruth);
-    }
-    else
-    {
-        // Cleanup for non-root processes
-        free(grid);
     }
     
     MPI_Finalize();
