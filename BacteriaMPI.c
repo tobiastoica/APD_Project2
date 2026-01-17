@@ -338,26 +338,25 @@ void mpi_bacteria(void)
     // Main evolution loop
     for (time = 0; time < MAXITER; time++)
     {   
-        // Exchange border with upper neighbor (rank-1)
+        // MPI request handles for non-blocking sends
+        MPI_Request send_req_up, send_req_down;
+        
+        // Initiate non-blocking sends to neighbors (async buffered)
         if (rank > 0)
         {
-            // Send my first real row (index 1) to rank-1
-            MPI_Send(&local_grid[1 * cols], cols, MPI_CHAR, rank - 1, 0, MPI_COMM_WORLD);
-            // Receive from rank-1 into my top ghost row (index 0)
-            MPI_Recv(&local_grid[0 * cols], cols, MPI_CHAR, rank - 1, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            // Send my first real row (index 1) to rank-1 (non-blocking)
+            MPI_Isend(&local_grid[1 * cols], cols, MPI_CHAR, rank - 1, 0, MPI_COMM_WORLD, &send_req_up);
         }
         
-        // Exchange border with lower neighbor (rank+1)
         if (rank < size - 1)
         {
-            // Receive from rank+1 into my bottom ghost row (index local_rows+1)
-            MPI_Recv(&local_grid[(local_rows + 1) * cols], cols, MPI_CHAR, rank + 1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            // Send my last real row (index local_rows) to rank+1
-            MPI_Send(&local_grid[local_rows * cols], cols, MPI_CHAR, rank + 1, 1, MPI_COMM_WORLD);
+            // Send my last real row (index local_rows) to rank+1 (non-blocking)
+            MPI_Isend(&local_grid[local_rows * cols], cols, MPI_CHAR, rank + 1, 1, MPI_COMM_WORLD, &send_req_down);
         }
         
-        // Compute new generation for local rows (indices 1 to local_rows)
-        for (i = 1; i <= local_rows; i++)
+        // Compute new generation for INTERIOR rows (indices 2 to local_rows-1)
+        // Skip first and last rows which need ghost data
+        for (i = 2; i < local_rows; i++)
         {
             for (j = 0; j < cols; j++)
             {
@@ -379,8 +378,74 @@ void mpi_bacteria(void)
             }
         }
         
+        // Now wait for receives (blocking)
+        if (rank > 0)
+        {
+            // Receive from rank-1 into my top ghost row (index 0)
+            MPI_Recv(&local_grid[0 * cols], cols, MPI_CHAR, rank - 1, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
+        
+        if (rank < size - 1)
+        {
+            // Receive from rank+1 into my bottom ghost row (index local_rows+1)
+            MPI_Recv(&local_grid[(local_rows + 1) * cols], cols, MPI_CHAR, rank + 1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
+        
+        // Now compute BOUNDARY rows (row 1 and row local_rows)
+        // First boundary row (index 1)
+        for (j = 0; j < cols; j++)
+        {
+            neighbors = number_of_neighbors(local_grid, 1, j, total_local_rows, cols);
+            switch(neighbors) 
+            {
+                case 2:
+                    local_new_grid[1 * cols + j] = local_grid[1 * cols + j];
+                    break;
+                case 3:
+                    local_new_grid[1 * cols + j] = 1;
+                    break;
+                case 0:
+                case 1:
+                default:
+                    local_new_grid[1 * cols + j] = 0;
+                    break;
+            }
+        }
+        
+        // Last boundary row (index local_rows)
+        for (j = 0; j < cols; j++)
+        {
+            neighbors = number_of_neighbors(local_grid, local_rows, j, total_local_rows, cols);
+            switch(neighbors) 
+            {
+                case 2:
+                    local_new_grid[local_rows * cols + j] = local_grid[local_rows * cols + j];
+                    break;
+                case 3:
+                    local_new_grid[local_rows * cols + j] = 1;
+                    break;
+                case 0:
+                case 1:
+                default:
+                    local_new_grid[local_rows * cols + j] = 0;
+                    break;
+            }
+        }
+        
         // Swap local grids
         swap_ptr(&local_grid, &local_new_grid);
+        
+        // Wait for sends to complete before next iteration modifies the buffers
+        // After swap, the old local_grid (now local_new_grid) will be written to
+        // in the next iteration, so we must ensure sends are done
+        if (rank > 0)
+        {
+            MPI_Wait(&send_req_up, MPI_STATUS_IGNORE);
+        }
+        if (rank < size - 1)
+        {
+            MPI_Wait(&send_req_down, MPI_STATUS_IGNORE);
+        }
     }
     
     // Gather results back to rank 0 (from row 1 onwards, skipping ghost row)
@@ -548,6 +613,16 @@ Grid saved to bacteria1000_serial_out.txt
 Initialize grid size Rows=1000, Cols=1000
 Start Parallel with NPROCS=3
 Parallel Time 3.269405  Speedup 2.478858
+Grid saved to bacteria1000_parallel_out.txt
+Parallel version produced the same result
+
+Initialize grid size Rows=1000, Cols=1000
+Start Serial with MAXITER=250
+Serial Time 8.099523
+Grid saved to bacteria1000_serial_out.txt
+Initialize grid size Rows=1000, Cols=1000
+Start Parallel with NPROCS=3
+Parallel Time 2.777029  Speedup 2.916614
 Grid saved to bacteria1000_parallel_out.txt
 Parallel version produced the same result
 */
